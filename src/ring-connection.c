@@ -47,6 +47,8 @@
 #include <telepathy-glib/intset.h>
 #include <telepathy-glib/svc-generic.h>
 #include <telepathy-glib/svc-connection.h>
+#include <telepathy-glib/simple-client-factory.h>
+#include <telepathy-glib/util.h>
 
 #include "ring-extensions/ring-extensions.h"
 
@@ -88,6 +90,8 @@ struct _RingConnectionPrivate
     gulong modem_interface_added;
     gulong modem_interface_removed;
     gulong imsi_notify;
+    gulong presence_offline;
+    gulong presence_available;
   } signals;
 
   guint connecting_source;
@@ -179,6 +183,75 @@ static char const * const ring_connection_interfaces_always_present[] = {
 #endif
   NULL
 };
+
+static void cb_for_async (GObject *account,
+		    GAsyncResult *res,
+		    gpointer user_data)
+{
+  gboolean (* finish_func) (TpAccount *, GAsyncResult *, GError **);
+  GError *error = NULL;
+
+  finish_func = user_data;
+
+  /*Not sure what could be done*/
+  if (!finish_func (TP_ACCOUNT (account), res, &error))
+    g_error_free (error);
+}
+
+static char *ensure_prefix (char const *string)
+{
+  if (g_str_has_prefix (string, TP_ACCOUNT_OBJECT_PATH_BASE))
+    return g_strdup (string);
+
+  return g_strdup_printf ("%s%s", TP_ACCOUNT_OBJECT_PATH_BASE, string);
+}
+
+static void 
+ring_set_presence (TpConnectionStatus connectionStatus)
+{
+  TpAccount *a = NULL;
+  TpDBusDaemon *dbus = NULL;
+  TpSimpleClientFactory *client_factory = NULL;
+  GError *error = NULL;
+  gchar *apath = NULL;
+  gchar *status = "offline";
+  TpConnectionPresenceType presenceType = TP_CONNECTION_PRESENCE_TYPE_UNSET;
+
+  dbus = tp_dbus_daemon_dup (&error);
+  if (error != NULL)
+    goto out;
+
+  client_factory = tp_simple_client_factory_new (dbus);
+
+  /*from mcp-account-manager-ring.c*/
+  apath = "ring/tel/account0";
+  apath = ensure_prefix(apath);
+  a = tp_simple_client_factory_ensure_account (client_factory, apath, NULL, &error);
+
+  if (error != NULL)
+    goto out;
+
+  switch (connectionStatus)
+    {
+    case TP_CONNECTION_STATUS_DISCONNECTED :
+      presenceType = TP_CONNECTION_PRESENCE_TYPE_OFFLINE;
+      break;
+    case TP_CONNECTION_STATUS_CONNECTED :
+      presenceType = TP_CONNECTION_PRESENCE_TYPE_AVAILABLE;
+      status = "available";
+      break;
+    default:
+      presenceType = TP_CONNECTION_PRESENCE_TYPE_UNKNOWN;
+      status = "unknown";
+    }
+
+  tp_account_request_presence_async(a,presenceType,status,NULL,cb_for_async,tp_account_request_presence_finish);
+
+out:
+  g_clear_error (&error);
+  tp_clear_object (&client_factory);
+  tp_clear_object (&a);
+}
 
 static void
 ring_connection_init(RingConnection *self)
@@ -1064,6 +1137,14 @@ ring_connection_imei_added (ModemService *modems,
 }
 
 static void
+ring_connection_setpresence_added (ModemService *modems,
+                             Modem *modem,
+                             gpointer _self)
+{
+  ring_set_presence (TP_CONNECTION_STATUS_CONNECTED);
+}
+
+static void
 ring_connection_modem_added (ModemService *modems,
                              Modem *modem,
                              gpointer _self)
@@ -1096,6 +1177,14 @@ ring_connection_modem_powered (ModemService *modems,
     return;
 
   ring_connection_bind_modem (self, modem);
+}
+
+static void
+ring_connection_setpresence_disconnected (ModemService *modems,
+                             Modem *modem,
+                             gpointer _self)
+{
+  ring_set_presence (TP_CONNECTION_STATUS_DISCONNECTED);
 }
 
 static void
@@ -1160,8 +1249,12 @@ ring_connection_start_connecting(TpBaseConnection *base,
       /* Connect to modem with given path */
       modem = modem_service_find_by_path (manager, priv->modem_path);
       if (!modem)
+        {
         priv->signals.modem_added = g_signal_connect (manager,
             "modem-added", G_CALLBACK (ring_connection_modem_added), self);
+        priv->signals.presence_available = g_signal_connect (manager,
+            "presence-available", G_CALLBACK (ring_connection_setpresence_added), self);
+        }
     }
   else
     {
@@ -1215,6 +1308,10 @@ ring_connection_connected (TpBaseConnection *base)
       "modem-removed",
       G_CALLBACK (ring_connection_modem_removed), self);
 
+  priv->signals.presence_offline = g_signal_connect (modem_service (),
+      "presence-offline",
+      G_CALLBACK (ring_connection_setpresence_disconnected), self);
+
   interfaces = modem_list_interfaces (priv->modem);
 
   if (interfaces)
@@ -1251,6 +1348,8 @@ ring_connection_disconnected(TpBaseConnection *base)
       priv->connecting_source = 0;
     }
 
+  ring_signal_disconnect (modem_service (), &priv->signals.presence_offline);
+  ring_signal_disconnect (modem_service (), &priv->signals.presence_available);
   ring_signal_disconnect (modem_service (), &priv->signals.modem_added);
   ring_signal_disconnect (modem_service (), &priv->signals.modem_removed);
   ring_signal_disconnect (priv->modem, &priv->signals.modem_interface_added);
