@@ -62,6 +62,8 @@ enum {
   SIGNAL_MODEM_REMOVED,
   SIGNAL_IMEI_ADDED,
   SIGNAL_IMSI_ADDED,
+  SIGNAL_PRESENCE_OFFLINE,
+  SIGNAL_PRESENCE_AVAILABLE,
   N_SIGNALS
 };
 
@@ -70,6 +72,7 @@ static guint signals[N_SIGNALS] = {0};
 struct _ModemServicePrivate
 {
   GHashTable *modems;
+  char *removed_modem_path;
 
   unsigned signals:1, subscribed:1;
   unsigned :0;
@@ -85,6 +88,10 @@ static void on_modem_notify_imei (Modem *, GParamSpec *, ModemService *);
 static void on_modem_notify_powered (Modem *, GParamSpec *, ModemService *);
 static void on_modem_imsi_added (Modem *, char const *imsi, ModemService *);
 static void on_modem_removed (DBusGProxy *, char const *, gpointer);
+static void signal_presence_offline (char const *object_path,
+                                            gpointer userdata);
+static void signal_presence_available (char const *object_path,
+                                              gpointer userdata);
 
 /* ------------------------------------------------------------------------ */
 
@@ -98,6 +105,9 @@ modem_service_init(ModemService *self)
 
   self->priv->modems = g_hash_table_new_full (g_str_hash, g_str_equal,
       g_free, g_object_unref);
+
+  self->priv->removed_modem_path = NULL;
+
 }
 
 static void
@@ -157,6 +167,63 @@ reply_to_get_modems (ModemOface *_self,
   modem_oface_check_connected (_self, request, error);
 }
 
+static DBusHandlerResult
+modem_dbus_filter (DBusConnection *connection,
+                      DBusMessage *message,
+                      void *userdata)
+{
+  const char *member,*interface;
+  ModemService *self = userdata;
+
+  if (dbus_message_get_type(message) != DBUS_MESSAGE_TYPE_SIGNAL)
+    return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+
+  member = dbus_message_get_member(message);
+  interface = dbus_message_get_interface(message);
+
+  if (!g_strcmp0(interface,DBUS_INTERFACE_DBUS) && 
+      !g_strcmp0(member,"NameOwnerChanged"))
+    {
+    /*
+     * This should be handled differently for multiple modems
+     * e.g. add modem to list when ModemAdded received and remove modem from
+     * list when ModemRemoved received and here check if any modems on list
+     */
+    if (self->priv->removed_modem_path)
+      {
+      DBusMessageIter iter;
+
+      if (!dbus_message_iter_init(message, &iter))
+        return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+
+      on_modem_removed (NULL, self->priv->removed_modem_path, userdata);
+
+      g_free(self->priv->removed_modem_path);
+      self->priv->removed_modem_path = NULL;
+
+      return DBUS_HANDLER_RESULT_HANDLED;
+      }
+    return DBUS_HANDLER_RESULT_HANDLED;
+    }
+
+  if (!g_strcmp0(interface,MODEM_OFACE_MANAGER) &&
+      !g_strcmp0(member,"ModemRemoved"))
+    {
+    DBusMessageIter iter;
+    const char *path;
+    if (!dbus_message_iter_init(message, &iter))
+	  return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+
+    dbus_message_iter_get_basic(&iter, &path);
+
+    signal_presence_offline (path, userdata);
+      
+    return DBUS_HANDLER_RESULT_HANDLED;
+    }
+
+  return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+}
+
 void
 modem_service_connect (ModemOface *_self)
 {
@@ -164,6 +231,8 @@ modem_service_connect (ModemOface *_self)
   ModemServicePrivate *priv = self->priv;
 
   DEBUG("enter");
+
+  priv->removed_modem_path = NULL;
 
   if (!priv->signals)
     {
@@ -178,8 +247,6 @@ modem_service_connect (ModemOface *_self)
       CONNECT (proxy, on_modem_added, "ModemAdded",
           DBUS_TYPE_G_OBJECT_PATH, MODEM_TYPE_DBUS_DICT, G_TYPE_INVALID);
 
-      CONNECT (proxy, on_modem_removed, "ModemRemoved",
-          DBUS_TYPE_G_OBJECT_PATH, G_TYPE_INVALID);
 
 #undef CONNECT
     }
@@ -193,6 +260,20 @@ modem_service_connect (ModemOface *_self)
       if (bus)
         {
           priv->subscribed = 1;
+	      dbus_bus_add_match (bus,
+              "type='signal',"
+              "sender='org.ofono',"
+              "interface='org.freedesktop.DBus',"
+              "member='NameOwnerChanged',"
+              "arg0='org.ofono'",
+              NULL);
+          dbus_bus_add_match (bus,
+              "type='signal',"
+              "sender='org.ofono',"
+              "interface='org.ofono.Modem',"
+              "member='ModemRemoved'",
+              NULL);
+          dbus_connection_add_filter (bus, modem_dbus_filter, self, NULL);
 
           dbus_bus_add_match (bus,
               "type='signal',"
@@ -272,8 +353,6 @@ modem_service_disconnect (ModemOface *_self)
 
       dbus_g_proxy_disconnect_signal (proxy, "ModemAdded",
           G_CALLBACK (on_modem_added), self);
-      dbus_g_proxy_disconnect_signal (proxy, "ModemRemoved",
-          G_CALLBACK (on_modem_removed), self);
     }
 
   DEBUG("leave");
@@ -294,6 +373,22 @@ modem_service_class_init(ModemServiceClass *klass)
   oface_class->ofono_interface = MODEM_OFACE_MANAGER;
   oface_class->connect = modem_service_connect;
   oface_class->disconnect = modem_service_disconnect;
+
+  signals[SIGNAL_PRESENCE_OFFLINE] = g_signal_new ("presence-offline",
+      G_OBJECT_CLASS_TYPE (klass),
+      G_SIGNAL_RUN_LAST | G_SIGNAL_DETAILED,
+      0,
+      NULL, NULL,
+      g_cclosure_marshal_VOID__OBJECT,
+      G_TYPE_NONE, 1, MODEM_TYPE_MODEM);
+
+  signals[SIGNAL_PRESENCE_AVAILABLE] = g_signal_new ("presence-available",
+      G_OBJECT_CLASS_TYPE (klass),
+      G_SIGNAL_RUN_LAST | G_SIGNAL_DETAILED,
+      0,
+      NULL, NULL,
+      g_cclosure_marshal_VOID__OBJECT,
+      G_TYPE_NONE, 1, MODEM_TYPE_MODEM);
 
   signals[SIGNAL_MODEM_ADDED] = g_signal_new ("modem-added",
       G_OBJECT_CLASS_TYPE (klass),
@@ -480,6 +575,18 @@ modem_service_get_modems (ModemService *self)
 }
 
 static void
+signal_presence_available (char const *object_path,
+                gpointer userdata)
+{
+  ModemService *self = userdata;
+  ModemServicePrivate *priv = self->priv;
+  Modem *modem;
+
+  modem = g_hash_table_lookup (priv->modems, object_path);
+  g_signal_emit (self, signals[SIGNAL_PRESENCE_AVAILABLE], 0, modem);
+}
+
+static void
 on_modem_added (DBusGProxy *_dummy,
                 char const *object_path,
                 GHashTable *properties,
@@ -492,10 +599,14 @@ on_modem_added (DBusGProxy *_dummy,
   if (DEBUGGING)
     modem_ofono_debug_managed ("ModemAdded", object_path, properties);
 
+  g_free(priv->removed_modem_path);
+  priv->removed_modem_path = NULL;
+
   modem = g_hash_table_lookup (priv->modems, object_path);
   if (modem)
     {
       DEBUG ("Modem %s already has object %p", object_path, (void *)modem);
+      signal_presence_available(object_path, userdata);
       return;
     }
 
@@ -528,6 +639,8 @@ on_modem_added (DBusGProxy *_dummy,
   on_modem_notify_powered (modem, NULL, self);
 
   on_modem_notify_imei (modem, NULL, self);
+
+  signal_presence_available(object_path, userdata);
 }
 
 static void
@@ -576,6 +689,28 @@ on_modem_imsi_added (Modem *modem,
 }
 
 static void
+signal_presence_offline (char const *object_path,
+                  gpointer userdata)
+{
+  ModemService *self = userdata;
+  ModemServicePrivate *priv = self->priv;
+  Modem *modem;
+
+  modem = g_hash_table_lookup (priv->modems, object_path);
+  if (!modem)
+    return;
+
+  /*
+   * This should be handled differently for multiple modems
+   * e.g. create list and on_modem_removed go through it
+   */
+  if (self->priv->removed_modem_path == NULL)
+    self->priv->removed_modem_path = g_strdup(object_path);
+
+  g_signal_emit (self, signals[SIGNAL_PRESENCE_OFFLINE], 0, NULL);
+}
+
+static void
 on_modem_removed (DBusGProxy *proxy,
                   char const *object_path,
                   gpointer userdata)
@@ -604,4 +739,5 @@ on_modem_removed (DBusGProxy *proxy,
       G_CALLBACK (on_modem_notify_powered), self);
 
   g_hash_table_remove (priv->modems, object_path);
+
 }
