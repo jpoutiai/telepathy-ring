@@ -114,9 +114,6 @@ add_modem (McpAccountManagerRing *self,
 
   g_debug ("Adding modem %s\n", path);
 
-  account_name = mcp_account_manager_get_unique_name (self->priv->am,
-      "ring", "tel", "account");
-
 #define PARAM(key, value) g_hash_table_insert (params, key, g_strdup (value));
   params = g_hash_table_new_full (g_str_hash, g_str_equal,
       NULL, g_free);
@@ -127,9 +124,10 @@ add_modem (McpAccountManagerRing *self,
   PARAM ("ConnectAutomatically", "true");
   PARAM ("always_dispatch", "true");
   PARAM ("param-modem", path);
-  PARAM ("org.freedesktop.Telepathy.Account.Interface.Addressing.URISchemes",
-      "tel;");
 #undef PARAM
+
+  account_name = mcp_account_manager_get_unique_name (self->priv->am,
+      "ring", "tel", params);
 
   g_hash_table_insert (self->priv->modems, account_name, params);
   g_signal_emit_by_name (self, "created", account_name);
@@ -382,6 +380,14 @@ account_manager_ring_get_restrictions (const McpAccountStorage *storage,
       TP_STORAGE_RESTRICTION_FLAG_CANNOT_SET_SERVICE;
 }
 
+static gboolean 
+account_manager_ring_delete(const McpAccountStorage *storage, const McpAccountManager *am,
+        const gchar *account_name, const gchar *key)
+{
+    g_debug("%s: %s, %s", G_STRFUNC, account_name, key);
+    return FALSE;
+}
+
 static void
 account_storage_iface_init (McpAccountStorageIface *iface)
 {
@@ -390,6 +396,7 @@ account_storage_iface_init (McpAccountStorageIface *iface)
   iface->priority = PLUGIN_PRIORITY;
   iface->provider = PLUGIN_PROVIDER;
 
+  iface->delete = account_manager_ring_delete;
   iface->get = account_manager_ring_get;
   iface->list = account_manager_ring_list;
   iface->ready = account_manager_ring_ready;
