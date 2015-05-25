@@ -46,6 +46,7 @@ struct _McpAccountManagerRingPrivate
   GQueue *pending_signals;
 
   gboolean ready;
+  GList *account_names;
 };
 
 typedef enum
@@ -62,7 +63,7 @@ typedef struct
 
 static void
 remove_modem (McpAccountManagerRing *self,
-    const gchar *path)
+              const gchar *path)
 {
   GHashTableIter iter;
   gpointer key, value;
@@ -80,6 +81,11 @@ remove_modem (McpAccountManagerRing *self,
 
   g_debug ("Removing modem %s\n", path);
 
+  gchar *account_name = g_strconcat("ring/", "tel", path, NULL);
+  GList *list_item = g_list_find(self->priv->account_names, account_name);
+  if (list_item)
+    g_list_remove(self->priv->account_names,list_item);
+
   g_hash_table_iter_init (&iter, self->priv->modems);
   while (g_hash_table_iter_next (&iter, &key, &value))
     {
@@ -96,7 +102,7 @@ remove_modem (McpAccountManagerRing *self,
 
 static void
 add_modem (McpAccountManagerRing *self,
-    const gchar *path)
+           const gchar *path)
 {
   gchar *account_name;
   GHashTable *params;
@@ -114,6 +120,11 @@ add_modem (McpAccountManagerRing *self,
 
   g_debug ("Adding modem %s\n", path);
 
+  /*Create name for account based on modem name*/
+  account_name = g_strconcat("ring/", "tel", path, NULL);
+  self->priv->account_names = g_list_append (self->priv->account_names,
+      account_name);
+
 #define PARAM(key, value) g_hash_table_insert (params, key, g_strdup (value));
   params = g_hash_table_new_full (g_str_hash, g_str_equal,
       NULL, g_free);
@@ -124,10 +135,9 @@ add_modem (McpAccountManagerRing *self,
   PARAM ("ConnectAutomatically", "true");
   PARAM ("always_dispatch", "true");
   PARAM ("param-modem", path);
+  PARAM ("org.freedesktop.Telepathy.Account.Interface.Addressing.URISchemes",
+      "tel;");
 #undef PARAM
-
-  account_name = mcp_account_manager_get_unique_name (self->priv->am,
-      "ring", "tel", params);
 
   g_hash_table_insert (self->priv->modems, account_name, params);
   g_signal_emit_by_name (self, "created", account_name);
@@ -135,10 +145,10 @@ add_modem (McpAccountManagerRing *self,
 
 static void
 manager_proxy_signal_cb (GDBusProxy *proxy,
-    gchar *sender_name,
-    gchar *signal_name,
-    GVariant *parameters,
-    McpAccountManagerRing *self)
+                         gchar *sender_name,
+                         gchar *signal_name,
+                         GVariant *parameters,
+                         McpAccountManagerRing *self)
 {
   const gchar *path;
 
@@ -156,8 +166,8 @@ manager_proxy_signal_cb (GDBusProxy *proxy,
 
 static void
 got_modems_cb (GObject *source,
-    GAsyncResult *result,
-    gpointer user_data)
+               GAsyncResult *result,
+               gpointer user_data)
 {
   McpAccountManagerRing *self = user_data;
   GVariant *modems;
@@ -182,8 +192,8 @@ got_modems_cb (GObject *source,
 
 static void
 got_manager_proxy_cb (GObject *source,
-    GAsyncResult *result,
-    gpointer user_data)
+                      GAsyncResult *result,
+                      gpointer user_data)
 {
   McpAccountManagerRing *self = user_data;
   GDBusProxy *proxy;
@@ -210,8 +220,8 @@ got_manager_proxy_cb (GObject *source,
 
 static void
 got_system_bus_cb (GObject *source,
-    GAsyncResult *result,
-    gpointer user_data)
+                   GAsyncResult *result,
+                   gpointer user_data)
 {
   McpAccountManagerRing *self = user_data;
   GDBusConnection *connection;
@@ -257,6 +267,8 @@ mcp_account_manager_ring_init (McpAccountManagerRing *self)
   self->priv = G_TYPE_INSTANCE_GET_PRIVATE (self, MCP_TYPE_ACCOUNT_MANAGER_RING,
       McpAccountManagerRingPrivate);
 
+  self->priv->account_names = NULL;
+
   self->priv->modems = g_hash_table_new_full (g_str_hash, g_str_equal,
       g_free, (GDestroyNotify) g_hash_table_unref);
   self->priv->pending_signals = g_queue_new ();
@@ -279,7 +291,7 @@ mcp_account_manager_ring_class_init (McpAccountManagerRingClass *klass)
 
 static GList *
 account_manager_ring_list (const McpAccountStorage *storage,
-    const McpAccountManager *am)
+                           const McpAccountManager *am)
 {
   McpAccountManagerRing *self = (McpAccountManagerRing*) storage;
   GList *accounts = NULL;
@@ -297,12 +309,28 @@ account_manager_ring_list (const McpAccountStorage *storage,
 
 static gboolean
 account_manager_ring_get (const McpAccountStorage *storage,
-    const McpAccountManager *am,
-    const gchar *account_name,
-    const gchar *key)
+                          const McpAccountManager *am,
+                          const gchar *account_name,
+                          const gchar *key)
 {
   McpAccountManagerRing *self = (McpAccountManagerRing*) storage;
   GHashTable *params;
+  gboolean match = FALSE;
+  GList *list;
+
+  if (!account_name)
+    return FALSE;
+
+  for (list = g_list_first(self->priv->account_names); list;
+       list = g_list_next(list)) {
+    if (!g_strcmp0(list->data,account_name)) {
+      match = TRUE;
+      break;
+    }
+  }
+
+  if(!match)
+      return FALSE;
 
   params = g_hash_table_lookup (self->priv->modems, account_name);
   if (params == NULL)
@@ -335,7 +363,7 @@ account_manager_ring_get (const McpAccountStorage *storage,
 
 static void
 account_manager_ring_ready (const McpAccountStorage *storage,
-    const McpAccountManager *am)
+                            const McpAccountManager *am)
 {
   McpAccountManagerRing *self = (McpAccountManagerRing *) storage;
   DelayedSignalData *data;
@@ -372,17 +400,37 @@ account_manager_ring_ready (const McpAccountStorage *storage,
 
 static guint
 account_manager_ring_get_restrictions (const McpAccountStorage *storage,
-    const gchar *account_name)
+                                       const gchar *account_name)
 {
+  McpAccountManagerRing *self = (McpAccountManagerRing*) storage;
+  gboolean match = FALSE;
+  GList *list;
+
+  if (!account_name)
+    return FALSE;
+
+  for (list = g_list_first(self->priv->account_names); list;
+       list = g_list_next(list)) {
+    if (!g_strcmp0(list->data,account_name)) {
+      match = TRUE;
+      break;
+    }
+  }
+
+  if (!match)
+    return G_MAXUINT;
+
   return TP_STORAGE_RESTRICTION_FLAG_CANNOT_SET_PARAMETERS |
       TP_STORAGE_RESTRICTION_FLAG_CANNOT_SET_ENABLED |
       TP_STORAGE_RESTRICTION_FLAG_CANNOT_SET_PRESENCE |
       TP_STORAGE_RESTRICTION_FLAG_CANNOT_SET_SERVICE;
 }
 
-static gboolean 
-account_manager_ring_delete(const McpAccountStorage *storage, const McpAccountManager *am,
-        const gchar *account_name, const gchar *key)
+static gboolean
+account_manager_ring_delete(const McpAccountStorage *storage,
+                            const McpAccountManager *am,
+                            const gchar *account_name,
+                            const gchar *key)
 {
     g_debug("%s: %s, %s", G_STRFUNC, account_name, key);
     return FALSE;
